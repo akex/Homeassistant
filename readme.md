@@ -91,7 +91,7 @@ Si les fichiers `card0` et `renderD128` apparaissent, le passthrough est opérat
 Exécutez le script officiel pour installer Docker de manière propre :
 ```bash
 apt update && apt install -y curl
-curl -fsSL https://docker.com -o get-docker.sh
+curl -fsSL https://get.docker.com -o get-docker.sh
 sh get-docker.sh
 ```
 
