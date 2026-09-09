@@ -1,31 +1,62 @@
-# Guide : Installation de Frigate sur Beelink S12 (Intel N100)
-## Proxmox LXC non privilégié + OpenVINO (iGPU)
+# Guide d'Installation : Frigate NVR avec OpenVINO sur Proxmox (LXC Non Privilégié)
 
-Ce guide résume la configuration complète pour faire tourner **Frigate NVR** dans un conteneur **LXC non privilégié** sur **Proxmox VE**, en utilisant l'iGPU de l'**Intel N100** pour l'accélération FFmpeg et la détection d'objets avec **OpenVINO**.
+Ce guide détaille l'installation pas-à-pas de Frigate NVR sur un mini-PC **Beelink S12 Pro (Intel N100)** en utilisant un conteneur **LXC Debian 12 non privilégié**. Cette méthode exploite l'iGPU Intel (via **OpenVINO**) pour la détection d'objets et le décodage matériel, offrant d'excellentes performances (~10-20ms d'inférence) sans accélérateur externe Google Coral.
 
 ---
 
-## 1. Configuration du Passthrough iGPU sur l'hôte Proxmox
+## 1. Choix et Création du LXC sur Proxmox
 
-### Étape 1.1 : Identifier les IDs du GPU
+L'OS recommandé est **Debian 12 (Bookworm)** pour sa légèreté, sa stabilité et sa gestion native des pilotes graphiques récents de l'architecture Intel Alder Lake-N (N100).
+
+1. Dans l'interface Proxmox, téléchargez le template officiel `debian-12-standard`.
+2. Cliquez sur **Create CT** et configurez les options suivantes :
+   * **Unprivileged container :** Coché (Actif).
+   * **CPU :** Au moins 2 cœurs.
+   * **RAM :** 2 Go de mémoire (minimum recommandé).
+   * **Root Disk :** Allouez l'espace selon vos besoins de stockage temporaire (les vidéos longues seront idéalement stockées sur un NAS ou un disque externe).
+
+---
+
+## 2. Configuration du Passthrough iGPU (Hôte Proxmox)
+
+Pour qu'un conteneur non privilégié accède à la carte graphique sans droits root, il faut mapper précisément les identifiants de groupe (GID) entre l'hôte et le conteneur.
+
+### Étape A : Identifier les IDs sur l'hôte Proxmox
 Connectez-vous en SSH sur votre hôte Proxmox et exécutez :
 ```bash
 ls -l /dev/dri
 ```
-Repérez les numéros majeurs/mineurs ainsi que le groupe (souvent `render`). Cherchez ensuite les GIDs associés sur l'hôte :
+*Exemple de retour :*
+```text
+crw-rw---- 1 root video  226,   0 Sep  9 12:00 card0
+crw-rw---- 1 root render 226, 128 Sep  9 12:00 renderD128
+```
+
+Trouvez les GID associés aux groupes `video` et `render` de l'hôte :
 ```bash
 cat /etc/group | grep -E "video|render"
 ```
-*Exemple de retour : `video:x:44:` et `render:x:104:` (Notez bien vos chiffres 44 et 104).*
+*Notez les numéros obtenus (ex: `video` = 44, `render` = 104). Les étapes suivantes utilisent 44 et 104 comme exemples.*
 
-### Étape 1.2 : Configurer le fichier du conteneur LXC
-Ouvrez le fichier de configuration de votre LXC (remplacez `100` par l'ID de votre conteneur) :
+### Étape B : Autoriser Proxmox à partager ces IDs
+Modifiez le fichier système des sous-groupes sur l'hôte Proxmox :
+```bash
+nano /etc/subgid
+```
+Ajoutez ces deux lignes à la fin (adaptez 44 et 104 avec vos valeurs) :
+```text
+root:44:1
+root:104:1
+```
+
+### Étape C : Associer l'iGPU au fichier de configuration du LXC
+Ouvrez le fichier de configuration de votre conteneur (remplacez `100` par l'ID de votre LXC) :
 ```bash
 nano /etc/pve/lxc/100.conf
 ```
-Ajoutez les lignes suivantes tout en bas (en adaptant `44` et `104` avec vos GIDs obtenus à l'étape précédente) :
+Ajoutez l'ensemble de ces lignes tout en bas du fichier :
 ```text
-# Autoriser l'accès aux caméras/GPU
+# Autoriser l'accès aux fichiers du GPU
 lxc.cgroup2.devices.allow: c 226:0 rwm
 lxc.cgroup2.devices.allow: c 226:128 rwm
 
@@ -33,7 +64,7 @@ lxc.cgroup2.devices.allow: c 226:128 rwm
 lxc.mount.entry: /dev/dri/card0 dev/dri/card0 none bind,optional,create=file
 lxc.mount.entry: /dev/dri/renderD128 dev/dri/renderD128 none bind,optional,create=file
 
-# Mapping UID/GID pour LXC non privilégié
+# Redirection des privilèges UID/GID (Mapping)
 lxc.idmap: u 0 100000 65536
 lxc.idmap: g 0 100000 44
 lxc.idmap: g 44 44 1
@@ -41,23 +72,34 @@ lxc.idmap: g 45 100045 59
 lxc.idmap: g 104 104 1
 lxc.idmap: g 105 101105 64432
 ```
+*Sauvegardez et quittez (`Ctrl+O` puis `Ctrl+X`). Démarrez votre LXC.*
 
-### Étape 1.3 : Autoriser le mapping sur l'hôte
-Modifiez le fichier d'autorisations des groupes subgid de Proxmox :
+---
+
+## 3. Déploiement de Docker dans le LXC
+
+Connectez-vous à la console de votre LXC Debian 12 tout juste démarré.
+
+### Étape A : Valider l'accès au GPU
+Exécutez la commande suivante à l'intérieur du conteneur :
 ```bash
-nano /etc/subgid
+ls -l /dev/dri
 ```
-Ajoutez ces deux lignes à la fin (adaptez si vos GIDs diffèrent de 44 et 104) :
-```text
-root:44:1
-root:104:1
+Si les fichiers `card0` et `renderD128` apparaissent, le passthrough est opérationnel.
+
+### Étape B : Installer l'environnement Docker
+Exécutez le script officiel pour installer Docker de manière propre :
+```bash
+apt update && apt install -y curl
+curl -fsSL https://docker.com -o get-docker.sh
+sh get-docker.sh
 ```
 
 ---
 
-## 2. Déploiement de Frigate (Docker-Compose)
+## 4. Fichiers de Configuration Prêts à l'Emploi
 
-Une fois le LXC démarré, installez-y Docker et créez l'architecture suivante.
+Créez un dossier dédié à Frigate (ex: `/opt/frigate`) et placez-y les deux fichiers suivants.
 
 ### `docker-compose.yml`
 ```yaml
@@ -65,7 +107,7 @@ version: "3.9"
 services:
   frigate:
     container_name: frigate
-    privileged: true # Recommandé pour l'accès fluide à /dev/dri dans le LXC
+    privileged: true # Indispensable dans le Docker interne pour outrepasser les conflits de droits
     restart: unless-stopped
     image: ghcr.io/blakeblackshear/frigate:stable
     shm_size: "128mb" # À augmenter (ex: 256mb) si vous avez plus de 4 caméras
@@ -77,35 +119,35 @@ services:
       - ./storage:/media/frigate
     ports:
       - "5000:5000"
-      - "8554:8554" # Flux RTSP (Go2RTC)
+      - "8554:8554" # Flux RTSP (via go2rtc)
       - "8555:8555" # WebRTC
 ```
 
-### `config/config.yml`
+### `config.yml` (Placé dans le sous-dossier `./config`)
 ```yaml
 mqtt:
-  enabled: false # Activez et configurez pour la liaison Home Assistant
+  enabled: false # Passez à true pour l'intégration Home Assistant
 
-# Détecteur OpenVINO exploitant l'iGPU de l'Intel N100
+# Détecteur OpenVINO configuré sur l'iGPU Intel
 detectors:
   ov:
     type: openvino
     device: GPU
 
-# Accélération matérielle FFmpeg globale (Intel QuickSync QSV)
+# Accélération matérielle globale pour les processeurs Intel récents
 ffmpeg:
-  hwaccel_args: preset-intel-qsv-h264 # Remplacez par preset-intel-qsv-h265 si caméras en H.265
+  hwaccel_args: preset-intel-qsv-h264 # Remplacez par preset-intel-qsv-h265 si vos caméras émettent en H.265
 
 cameras:
   camera_exemple:
     ffmpeg:
       inputs:
-        # Flux secondaire de basse résolution (ex: 720p ou moins) pour la détection
-        - path: rtsp://user:password@192.168.1.50:554/stream2
+        # Flux secondaire (basse résolution type 720p ou moins) dédié à la détection
+        - path: rtsp://votre_utilisateur:votre_mot_de_passe@192.168.1.50:554/stream2
           roles:
             - detect
-        # Flux principal haute résolution pour les enregistrements
-        - path: rtsp://user:password@192.168.1.50:554/stream1
+        # Flux principal (haute résolution) dédié aux enregistrements
+        - path: rtsp://votre_utilisateur:votre_mot_de_passe@192.168.1.50:554/stream1
           roles:
             - record
     detect:
@@ -118,6 +160,8 @@ cameras:
 
 ---
 
-## 💡 Conseils de performance
-1. **Premier démarrage :** Le premier lancement prendra 1 à 3 minutes. OpenVINO doit compiler le modèle YOLOx spécifiquement pour l'iGPU Intel. C'est un comportement normal.
-2. **Substreams :** Utilisez impérativement des flux basse résolution pour le rôle `detect` afin de maintenir l'utilisation du processeur et de l'iGPU au plus bas.
+## 5. Bonnes Pratiques & Conseils pour le N100
+
+* **Flux de détection léger :** Configurez systématiquement un flux secondaire (substream) basse résolution (ex: 640x480 ou 1280x720) pour le rôle `detect`. Faire analyser des flux 2K ou 4K par OpenVINO surchargerait inutilement l'iGPU.
+* **Premier démarrage :** Lors du premier lancement, Frigate compile le modèle YOLOx spécifiquement pour l'iGPU de l'Intel N100. Cette opération prend **1 à 3 minutes** pendant lesquelles l'interface peut sembler indisponible. Laissez le processus se terminer.
+* **Suivi des performances :** Une fois démarré, l'onglet **System** de l'interface Frigate vous permettra de valider le temps de réponse du détecteur `ov` ainsi que la bonne prise en charge du décodage matériel.
