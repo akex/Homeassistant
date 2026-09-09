@@ -70,7 +70,7 @@ lxc.idmap: g 0 100000 44
 lxc.idmap: g 44 44 1
 lxc.idmap: g 45 100045 59
 lxc.idmap: g 104 104 1
-lxc.idmap: g 105 101105 64431
+lxc.idmap: g 105 100105 65431
 ```
 *Sauvegardez et quittez (`Ctrl+O` puis `Ctrl+X`). Démarrez votre LXC.*
 
